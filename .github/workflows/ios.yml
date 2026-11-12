@@ -1,4 +1,4 @@
-name: Build iOS IPA
+﻿name: Build iOS IPA
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     name: Build unsigned IPA
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
@@ -44,12 +44,12 @@ jobs:
       - name: Package unsigned IPA
         run: |
           APP="ios/build/Build/Products/Release-iphoneos/YunX.app"
-          test -d "$APP" || { echo "没找到 YunX.app"; ls -R ios/build/Build/Products || true; exit 1; }
+          test -d "$APP" || { echo "娌℃壘鍒?YunX.app"; ls -R ios/build/Build/Products || true; exit 1; }
           mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qry YunX-unsigned.ipa Payload
           ls -lh YunX-unsigned.ipa
-          echo "IPA 已生成：用 Sideloadly / AltStore 签名安装" >> $GITHUB_STEP_SUMMARY
+          echo "IPA 宸茬敓鎴愶細鐢?Sideloadly / AltStore 绛惧悕瀹夎" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -58,3 +58,4 @@ jobs:
           path: YunX-unsigned.ipa
           retention-days: 30
           if-no-files-found: error
+

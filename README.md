@@ -6,6 +6,7 @@
 - 目标系统：iOS 16+
 - 代码：13 个 Swift 文件，约 1250 行
 - 已做语法自检：`py tools/verify.py` → 13 files, 0 errors
+- 已实机构建：GitHub Actions `macos-15-intel` → `YunX-unsigned.ipa`（arm64，191 KB，Bundle ID `com.yunx.ios`）
 - 编译在 GitHub Actions 的 macOS runner 上跑（Windows 电脑不用装任何 Apple 工具）
 
 ---
@@ -60,9 +61,12 @@
    网页上传：`Add file → Upload files`，把文件夹拖进去，Commit。
 
 2. **让它编译**
-   仓库 → `Actions` → 左侧 `Build iOS IPA` → `Run workflow` → 等 3~6 分钟。
+   仓库 → `Actions` → 左侧 `Build iOS IPA` → `Run workflow` → 等 3~6 分钟（macOS 机器排队可能要 10~20 分钟）。
    绿色对勾后，点进这次运行 → 页面底部 `Artifacts` → 下载 `YunX-unsigned-ipa` → 解压得到
    `YunX-unsigned.ipa`。
+
+> 实测坑：`macos-14` 镜像已下架（任务秒取消），`macos-15`（arm64）在免费账号上常常排不到机器。
+> 现用 `runs-on: macos-15-intel`，能正常出包。排到机器后编译只要 2~4 分钟。
 
 3. **装到手机（Windows）**
    - 装 [Sideloadly](https://sideloadly.io/)（免费）；

@@ -23,13 +23,22 @@ struct SettingsView: View {
 
                 Section {
                     if let cookie = savedCookie {
+                        let missing = CookieStore.missingKey(cookie, for: platform)
                         Text("已保存 \(cookie.count) 字符：\(cookie.prefix(20))…")
                             .font(.caption)
                             .foregroundColor(.secondary)
+                        if let missing {
+                            Text("缺少登录字段 \(missing)，这份 Cookie 不可用，请重新登录")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        }
                     } else {
-                        Text("未配置（夸克/UC 取直链必须登录）")
+                        Text("未配置（夸克/UC/百度取直链必须登录）")
                             .font(.caption)
                             .foregroundColor(.secondary)
+                    }
+                    if !CookieStore.lastError.isEmpty {
+                        Text(CookieStore.lastError).font(.caption2).foregroundColor(.orange)
                     }
 
                     Button {

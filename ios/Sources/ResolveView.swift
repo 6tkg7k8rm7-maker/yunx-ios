@@ -10,6 +10,8 @@ struct ContentView: View {
                 .tabItem { Label("下载", systemImage: "arrow.down.circle") }
             SettingsView()
                 .tabItem { Label("账号", systemImage: "person.crop.circle") }
+            DiagnosticsView()
+                .tabItem { Label("诊断", systemImage: "stethoscope") }
         }
     }
 }
@@ -125,6 +127,12 @@ struct ResolveView: View {
             loginPlatform = parsed.platform
             showLogin = true
             errorText = "先登录 \(parsed.platform.title)，或在「账号」页粘贴 Cookie"
+            return
+        }
+        if let missing = CookieStore.missingKey(cookie, for: parsed.platform) {
+            loginPlatform = parsed.platform
+            showLogin = true
+            errorText = "Cookie 里缺少登录字段 \(missing)，请重新登录一次（现在的 Cookie 不是登录态）"
             return
         }
         loading = true

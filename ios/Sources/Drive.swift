@@ -66,7 +66,10 @@ struct BaiduDrive: CloudDrive {
     }
 
     func list(dirID: String) async throws -> [CloudFile] {
-        try await client.list(state: state, dir: dirID)
+        if dirID.isEmpty || dirID == "/" {
+            return try await client.list(surl: state.surl, sekey: state.sekey, dir: "/").files
+        }
+        return try await client.listSub(state: state, dir: dirID)
     }
 
     func direct(_ file: CloudFile) async throws -> DirectLink {

@@ -8,16 +8,35 @@ struct LoginSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var progress = 0.0
     @State private var capturing = false
+    @State private var message: String?
 
     var body: some View {
         NavigationStack {
             ZStack(alignment: .top) {
-                WebView(url: platform.loginURL, progress: $progress)
+                WebView(url: platform.loginURL,
+                        progress: $progress,
+                        onCookies: { cookies in
+                            // 每次页面加载完都顺手抓一次，避免用户点「完成」时还没同步
+                            let header = Self.header(from: cookies, platform: platform)
+                            if !header.isEmpty {
+                                CookieStore.save(header, for: platform)
+                            }
+                        })
                     .ignoresSafeArea(edges: .bottom)
                 if progress < 1.0 {
                     ProgressView(value: progress)
                         .progressViewStyle(.linear)
                         .tint(.accentColor)
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                if let message {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .padding(8)
+                        .frame(maxWidth: .infinity)
+                        .background(.thinMaterial)
                 }
             }
             .navigationTitle("登录 \(platform.title)")
@@ -34,30 +53,52 @@ struct LoginSheet: View {
         }
     }
 
-    /// 登录完成时把该域名下的 Cookie 拼成请求头存进 Keychain
     private func capture() {
         capturing = true
-        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-            let matched = cookies.filter { $0.domain.contains(platform.cookieHost) }
-            let header = matched.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+        message = nil
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { webCookies in
+            var all = webCookies
+            if let shared = HTTPCookieStorage.shared.cookies {
+                all.append(contentsOf: shared)
+            }
+            let header = Self.header(from: all, platform: platform)
             DispatchQueue.main.async {
                 capturing = false
-                if !header.isEmpty {
-                    CookieStore.save(header, for: platform)
+                guard !header.isEmpty else {
+                    message = "没抓到 \(platform.title) 的 Cookie。请在页面里完成登录后再点「完成」。"
+                    return
                 }
+                if let missing = CookieStore.missingKey(header, for: platform) {
+                    message = "抓到了 Cookie，但缺少登录态字段 \(missing)，可能还没登录成功。"
+                    CookieStore.save(header, for: platform)
+                    return
+                }
+                CookieStore.save(header, for: platform)
                 onFinish()
                 dismiss()
             }
         }
+    }
+
+    private static func header(from cookies: [HTTPCookie], platform: Platform) -> String {
+        var seen = Set<String>()
+        var parts: [String] = []
+        for cookie in cookies where cookie.domain.contains(platform.cookieHost) {
+            if seen.contains(cookie.name) { continue }
+            seen.insert(cookie.name)
+            parts.append("\(cookie.name)=\(cookie.value)")
+        }
+        return parts.joined(separator: "; ")
     }
 }
 
 struct WebView: UIViewRepresentable {
     let url: URL
     @Binding var progress: Double
+    var onCookies: ([HTTPCookie]) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(progress: $progress)
+        Coordinator(progress: $progress, onCookies: onCookies)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -74,10 +115,12 @@ struct WebView: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         private let progress: Binding<Double>
+        private let onCookies: ([HTTPCookie]) -> Void
         private var observation: NSKeyValueObservation?
 
-        init(progress: Binding<Double>) {
+        init(progress: Binding<Double>, onCookies: @escaping ([HTTPCookie]) -> Void) {
             self.progress = progress
+            self.onCookies = onCookies
         }
 
         func startObserving(_ webView: WKWebView) {
@@ -85,6 +128,12 @@ struct WebView: UIViewRepresentable {
                 DispatchQueue.main.async {
                     self?.progress.wrappedValue = view.estimatedProgress
                 }
+            }
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+                self?.onCookies(cookies)
             }
         }
     }

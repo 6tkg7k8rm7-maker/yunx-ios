@@ -49,6 +49,7 @@ struct ResolveView: View {
     @State private var errorText: String?
     @State private var showLogin = false
     @State private var loginPlatform: Platform = .quark
+    @FocusState private var linkFocused: Bool
 
     var body: some View {
         NavigationStack {
@@ -58,6 +59,7 @@ struct ResolveView: View {
                         .lineLimit(1...3)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .focused($linkFocused)
                     HStack {
                         Button {
                             if let clip = UIPasteboard.general.string { text = clip }
@@ -109,6 +111,7 @@ struct ResolveView: View {
                 }
             }
             .navigationTitle("云析")
+            .keyboardDoneButton($linkFocused)
             .sheet(isPresented: $showLogin) {
                 LoginSheet(platform: loginPlatform) { showLogin = false }
             }

@@ -6,6 +6,7 @@ struct SettingsView: View {
     @State private var toast = false
     @State private var showLogin = false
     @State private var savedCookie: String?
+    @FocusState private var cookieFocused: Bool
 
     var body: some View {
         NavigationStack {
@@ -52,6 +53,7 @@ struct SettingsView: View {
                         .font(.caption)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .focused($cookieFocused)
 
                     HStack {
                         Button("保存 Cookie") {
@@ -87,6 +89,7 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("账号")
+            .keyboardDoneButton($cookieFocused)
             .onChange(of: platform) { _ in
                 input = ""
                 reload()

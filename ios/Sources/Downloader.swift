@@ -41,6 +41,7 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
     private var plans: [UUID: [PartPlan]] = [:]
     private var metas: [UUID: Meta] = [:]
     private var taskMap: [Int: (id: UUID, index: Int)] = [:]
+    private var runningTasks: [Int: URLSessionTask] = [:]
     private var written: [UUID: [Int: Int64]] = [:]
     private var pausedIDs = Set<UUID>()
     private var lastTick: [UUID: (Date, Int64)] = [:]
@@ -112,9 +113,10 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
         lock.lock()
         pausedIDs.insert(id)
         let ids = taskMap.filter { $0.value.id == id }.map { $0.key }
+        let running = ids.compactMap { runningTasks[$0] }
         lock.unlock()
-        for key in ids {
-            session.task(withIdentifier: key)?.cancel()
+        for task in running {
+            task.cancel()
         }
         update(id: id) { item in
             if item.state != "已完成" { item.state = "已暂停"; item.paused = true }
@@ -180,6 +182,7 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
             }
             let downloadTask = session.downloadTask(with: request)
             taskMap[downloadTask.taskIdentifier] = (id, index)
+            runningTasks[downloadTask.taskIdentifier] = downloadTask
             started += 1
             downloadTask.resume()
         }
@@ -267,6 +270,7 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
         lock.lock()
         guard let ref = taskMap[key], var parts = plans[ref.id], ref.index < parts.count else {
             taskMap.removeValue(forKey: key)
+            runningTasks.removeValue(forKey: key)
             lock.unlock()
             return
         }
@@ -274,6 +278,7 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
         let dir = metas[ref.id]?.dir ?? FileManager.default.temporaryDirectory
         let incoming = dir.appendingPathComponent("incoming-\(ref.index)-\(UUID().uuidString)")
         taskMap.removeValue(forKey: key)
+        runningTasks.removeValue(forKey: key)
         lock.unlock()
 
         do {
@@ -310,13 +315,17 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         let key = task.taskIdentifier
         guard let error = error else {
-            lock.lock(); taskMap.removeValue(forKey: key); lock.unlock()
+            lock.lock()
+            taskMap.removeValue(forKey: key)
+            runningTasks.removeValue(forKey: key)
+            lock.unlock()
             return
         }
         lock.lock()
         let ref = taskMap[key]
         let paused = ref.map { pausedIDs.contains($0.id) } ?? false
         taskMap.removeValue(forKey: key)
+        runningTasks.removeValue(forKey: key)
         lock.unlock()
         if !paused, let ref {
             fail(id: ref.id, message: error.localizedDescription)

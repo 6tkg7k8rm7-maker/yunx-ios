@@ -19,6 +19,14 @@ struct DownloadsView: View {
             .toolbar {
                 Button("清理已完成") { downloader.clearFinished() }
             }
+            .safeAreaInset(edge: .bottom) {
+                Text("文件位置：文件 App › 我的 iPhone › 云析")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .padding(8)
+                    .frame(maxWidth: .infinity)
+                    .background(.thinMaterial)
+            }
         }
     }
 
@@ -35,6 +43,19 @@ struct DownloadsView: View {
                     .foregroundColor(task.state == "失败" ? .red : .secondary)
             }
             ProgressView(value: task.progress)
+            HStack {
+                if task.total > 0 {
+                    Text(ByteCountFormatter.string(fromByteCount: task.total, countStyle: .file))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                if !task.speed.isEmpty {
+                    Text(task.speed)
+                        .font(.caption2)
+                        .foregroundColor(.accentColor)
+                }
+            }
             if let error = task.error {
                 Text(error)
                     .font(.caption2)

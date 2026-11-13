@@ -151,24 +151,53 @@ struct BaiduClient {
 
     // MARK: - 3. 转存
 
-    func transfer(state: BaiduShareState, fsID: String, toDir: String = "/") async throws -> String {
-        let token = try await bdstoken()
-        var items: [(String, String)] = [
-            ("shareid", state.shareID),
-            ("from", state.uk),
-            ("channel", "chunlei"),
-            ("ondup", "newcopy"),
-            ("web", "1"),
-            ("app_id", Self.appID),
-            ("bdstoken", token),
-            ("clienttype", "0")
-        ]
-        if !state.sekey.isEmpty { items.append(("sekey", state.sekeyQuery)) }
+    /// 百度对 sekey 的编码处理在不同链路上不一致：查询参数可能要求原始编码串，
+    /// Cookie 里的 BDCLND 可能要求解码值。这里按三种组合依次重试，命中即返回。
+    func transfer(state: BaiduShareState, fsID: String, toDir: String) async throws -> String {
+        var lastError: Error?
+        // 组合 1：query=解码值，Cookie=原始值（理论上最正确）
+        do { return try await transferOnce(state: state, fsID: fsID, toDir: toDir, query: .decoded, cookie: .raw) }
+        catch { lastError = error }
+        // 组合 2：query=原始值（不再编码），Cookie=原始值
+        do { return try await transferOnce(state: state, fsID: fsID, toDir: toDir, query: .raw, cookie: .raw) }
+        catch { lastError = error }
+        // 组合 3：query 不带 sekey，Cookie=解码值
+        do { return try await transferOnce(state: state, fsID: fsID, toDir: toDir, query: .none, cookie: .decoded) }
+        catch { lastError = error }
+        throw lastError ?? AppError.message("转存失败")
+    }
 
-        var request = URLRequest(url: url("https://pan.baidu.com/share/transfer", items))
+    private enum SekeyUse { case decoded, raw, none }
+
+    private func transferOnce(state: BaiduShareState,
+                              fsID: String,
+                              toDir: String,
+                              query: SekeyUse,
+                              cookie cookieUse: SekeyUse) async throws -> String {
+        let token = try await bdstoken()
+
+        var base = "https://pan.baidu.com/share/transfer?"
+            + "shareid=\(Net.encode(state.shareID))"
+            + "&from=\(Net.encode(state.uk))"
+            + "&channel=chunlei&ondup=newcopy&web=1"
+            + "&app_id=\(Self.appID)&bdstoken=\(Net.encode(token))&clienttype=0"
+        switch query {
+        case .decoded: base += "&sekey=\(Net.encode(state.sekeyQuery))"
+        case .raw: base += "&sekey=\(state.sekey)"
+        case .none: break
+        }
+
+        var cookieValue = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch cookieUse {
+        case .decoded: cookieValue = withSekey(cookieValue, state.sekeyQuery)
+        case .raw: cookieValue = withSekey(cookieValue, state.sekey)
+        case .none: break
+        }
+
+        var request = URLRequest(url: URL(string: base)!)
         request.httpMethod = "POST"
         request.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
-        request.setValue(authCookie(sekey: state.sekey), forHTTPHeaderField: "Cookie")
+        request.setValue(cookieValue, forHTTPHeaderField: "Cookie")
         request.setValue("https://pan.baidu.com", forHTTPHeaderField: "Origin")
         request.setValue("https://pan.baidu.com/s/", forHTTPHeaderField: "Referer")
         request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
@@ -184,6 +213,11 @@ struct BaiduClient {
             throw AppError.message("转存：百度没返回新文件路径")
         }
         return to
+    }
+
+    private func withSekey(_ cookie: String, _ sekey: String) -> String {
+        guard !sekey.isEmpty, !cookie.contains("BDCLND=") else { return cookie }
+        return cookie.isEmpty ? "BDCLND=\(sekey)" : "\(cookie); BDCLND=\(sekey)"
     }
 
     // MARK: - 4. 高速直链（locatedownload）

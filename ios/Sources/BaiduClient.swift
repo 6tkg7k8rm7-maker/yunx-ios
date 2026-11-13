@@ -298,11 +298,66 @@ struct BaiduClient {
         try await list(surl: state.surl, sekey: state.sekey, dir: dir).files
     }
 
-    /// 取直链：建临时目录 → 转存 → locatedownload
+    /// 取直链：优先「建目录 → 转存 → locatedownload」，
+    /// 失败则回退到「分享页 sign + sharedownload」（不占用户网盘空间）
     func direct(state: BaiduShareState, fsID: String) async throws -> DirectLink {
-        let dir = try await ensureTransferDir()
-        let path = try await transfer(state: state, fsID: fsID, toDir: dir)
-        return try await locatedownload(path: path)
+        do {
+            let dir = try await ensureTransferDir()
+            let path = try await transfer(state: state, fsID: fsID, toDir: dir)
+            return try await locatedownload(path: path)
+        } catch {
+            RequestLog.add("BAIDU", step: "转存链路失败", detail: error.localizedDescription + "，改用 sharedownload", ok: false)
+            return try await sharedDownload(state: state, fsID: fsID)
+        }
+    }
+
+    // MARK: - 3b. sharedownload（不走转存）
+
+    private func firstMatch(_ pattern: String, in text: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = re.firstMatch(in: text, options: [], range: range),
+              match.numberOfRanges > 1,
+              let r = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[r])
+    }
+
+    func sharedDownload(state: BaiduShareState, fsID: String) async throws -> DirectLink {
+        let pageURL = URL(string: "https://pan.baidu.com/s/1\(state.surl)")!
+        var pageRequest = URLRequest(url: pageURL)
+        pageRequest.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
+        pageRequest.setValue(withSekey(cookie, state.sekey), forHTTPHeaderField: "Cookie")
+        let (data, _) = try await URLSession.shared.data(for: pageRequest)
+        let html = String(data: data, encoding: .utf8) ?? ""
+        guard let sign = firstMatch("\"sign\":\"([0-9A-Za-z]+)\"", in: html),
+              let timestamp = firstMatch("\"timestamp\":(\\d+)", in: html) else {
+            throw AppError.message("分享页里没找到 sign/timestamp（百度页面结构可能变了）")
+        }
+
+        let target = url("https://pan.baidu.com/api/sharedownload", [
+            ("sign", sign), ("timestamp", timestamp), ("channel", "chunlei"),
+            ("web", "1"), ("app_id", Self.appID), ("clienttype", "0")
+        ])
+        var request = URLRequest(url: target)
+        request.httpMethod = "POST"
+        request.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
+        request.setValue(withSekey(cookie, state.sekey), forHTTPHeaderField: "Cookie")
+        request.setValue("https://pan.baidu.com/s/1\(state.surl)", forHTTPHeaderField: "Referer")
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "encrypt=0&product=share&type=dlink&fid_list=[\(fsID)]".data(using: .utf8)
+
+        let json = try await Net.json(request, platform: "BAIDU", step: "sharedownload")
+        try Self.checkErrno(json)
+        guard let list = json["list"] as? [[String: Any]],
+              let dlink = list.first?["dlink"] as? String,
+              let dlURL = URL(string: dlink) else {
+            throw AppError.message("sharedownload 没返回 dlink")
+        }
+        return DirectLink(url: dlURL, headers: [
+            "User-Agent": Self.netdiskUA,
+            "Referer": "https://pan.baidu.com/",
+            "Cookie": withSekey(cookie, state.sekey)
+        ])
     }
 
     static let transferDir = "/云析下载"

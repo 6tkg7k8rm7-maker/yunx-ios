@@ -304,7 +304,7 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
         lock.lock(); refs.removeValue(forKey: key); lock.unlock()
     }
 
-    private func update(id: UUID, _ change: (inout DlTask) -> Void) {
+    private func update(id: UUID, _ change: @escaping (inout DlTask) -> Void) {
         DispatchQueue.main.async {
             if let index = self.tasks.firstIndex(where: { $0.id == id }) {
                 change(&self.tasks[index])

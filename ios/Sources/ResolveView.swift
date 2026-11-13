@@ -49,6 +49,8 @@ struct ResolveView: View {
     @State private var errorText: String?
     @State private var showLogin = false
     @State private var loginPlatform: Platform = .quark
+    @State private var baiduShareLink: URL?
+    @State private var webURL: WebURL?
     @FocusState private var linkFocused: Bool
 
     var body: some View {
@@ -88,6 +90,13 @@ struct ResolveView: View {
 
                 if let context {
                     Section {
+                        if context.platform == .baidu, let link = baiduShareLink {
+                            Button {
+                                webURL = WebURL(url: link)
+                            } label: {
+                                Label("用百度网页下载（推荐）", systemImage: "safari")
+                            }
+                        }
                         ForEach(files) { file in
                             if file.isDir {
                                 NavigationLink {
@@ -114,6 +123,9 @@ struct ResolveView: View {
             .keyboardDoneButton($linkFocused)
             .sheet(isPresented: $showLogin) {
                 LoginSheet(platform: loginPlatform) { showLogin = false }
+            }
+            .sheet(item: $webURL) { item in
+                BaiduWebSheet(url: item.url) { _ in }
             }
         }
     }
@@ -158,6 +170,11 @@ struct ResolveView: View {
                                        cookie: cookie,
                                        state: .baidu(result.state))
                 files = result.files
+                var comp = URLComponents(string: "https://pan.baidu.com/s/1\(parsed.shareID)")
+                if let pwd = parsed.pwd, !pwd.isEmpty {
+                    comp?.queryItems = [URLQueryItem(name: "pwd", value: pwd)]
+                }
+                baiduShareLink = comp?.url
             }
             if files.isEmpty { errorText = "分享里没有文件" }
         } catch {

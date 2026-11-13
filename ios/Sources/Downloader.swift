@@ -20,7 +20,11 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
 
     static let shared = Downloader()
 
-    var connections: Int = 6
+    /// 分片并发数（设置页可选 4/8/16，默认 8）
+    var connections: Int {
+        let saved = UserDefaults.standard.integer(forKey: "yunx.connections")
+        return saved > 0 ? min(max(saved, 2), 16) : 8
+    }
 
     @Published private(set) var tasks: [DlTask] = []
 

@@ -7,6 +7,7 @@ struct SettingsView: View {
     @State private var showLogin = false
     @State private var savedCookie: String?
     @FocusState private var cookieFocused: Bool
+    @AppStorage("yunx.connections") private var connections = 8
 
     var body: some View {
         NavigationStack {
@@ -74,6 +75,19 @@ struct SettingsView: View {
                     Text("凭证")
                 } footer: {
                     Text("登录后会自动抓取；也可从电脑浏览器复制整行 Cookie 粘贴。Cookie 存 Keychain，只在本机。百度要包含 BDUSS。")
+                }
+
+                Section {
+                    Picker("下载并发", selection: $connections) {
+                        Text("4").tag(4)
+                        Text("8").tag(8)
+                        Text("16").tag(16)
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("下载")
+                } footer: {
+                    Text("并发只是把带宽打满，突破不了网盘账号档位的限速（非会员被服务端限速，客户端改不了）。")
                 }
 
                 Section {

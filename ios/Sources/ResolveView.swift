@@ -98,7 +98,13 @@ struct ResolveView: View {
                             }
                         }
                         ForEach(files) { file in
-                            if file.isDir {
+                            if context.platform == .baidu {
+                                Button {
+                                    if let link = baiduShareLink { webURL = WebURL(url: link) }
+                                } label: {
+                                    FileRow(file: file)
+                                }
+                            } else if file.isDir {
                                 NavigationLink {
                                     FolderView(context: context, dirID: file.fid, title: file.name)
                                 } label: {

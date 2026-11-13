@@ -9,7 +9,6 @@ protocol CloudDrive {
 
 enum DriveState {
     case quark(shareID: String, stoken: String)
-    case baidu(BaiduShareState)
 }
 
 struct DriveContext {
@@ -25,8 +24,6 @@ func makeDrive(_ context: DriveContext) -> CloudDrive {
                           cookie: context.cookie,
                           shareID: shareID,
                           stoken: stoken)
-    case .baidu(let state):
-        return BaiduDrive(cookie: context.cookie, state: state)
     }
 }
 
@@ -50,29 +47,5 @@ struct QuarkDrive: CloudDrive {
 
     func direct(_ file: CloudFile) async throws -> DirectLink {
         try await client.direct(shareID: shareID, stoken: stoken, file: file)
-    }
-}
-
-// MARK: - 百度
-
-struct BaiduDrive: CloudDrive {
-    let cookie: String
-    let state: BaiduShareState
-
-    var rootID: String { "/" }
-
-    private var client: BaiduClient {
-        BaiduClient(cookie: cookie)
-    }
-
-    func list(dirID: String) async throws -> [CloudFile] {
-        if dirID.isEmpty || dirID == "/" {
-            return try await client.list(surl: state.surl, sekey: state.sekey, dir: "/").files
-        }
-        return try await client.listSub(state: state, dir: dirID)
-    }
-
-    func direct(_ file: CloudFile) async throws -> DirectLink {
-        try await client.direct(state: state, fsID: file.fid)
     }
 }

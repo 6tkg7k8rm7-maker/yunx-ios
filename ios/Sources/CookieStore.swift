@@ -70,8 +70,6 @@ enum CookieStore {
         case .quark, .uc:
             if !cookie.contains("__pus=") { return "__pus" }
             if !cookie.contains("__puus=") { return "__puus" }
-        case .baidu:
-            if !cookie.contains("BDUSS=") { return "BDUSS" }
         }
         return nil
     }

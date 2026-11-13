@@ -74,7 +74,7 @@ struct SettingsView: View {
                 } header: {
                     Text("凭证")
                 } footer: {
-                    Text("登录后会自动抓取；也可从电脑浏览器复制整行 Cookie 粘贴。Cookie 存 Keychain，只在本机。百度要包含 BDUSS。")
+                    Text("登录后会自动抓取；也可从电脑浏览器复制整行 Cookie 粘贴。Cookie 存 Keychain，只在本机。")
                 }
 
                 Section {
@@ -91,9 +91,9 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Text("支持：夸克网盘、UC 网盘、百度网盘（分享解析 + 取直链 + 下载）")
+                    Text("支持：夸克网盘、UC 网盘（分享解析 + 转存 + 取直链 + 下载）")
                         .font(.caption)
-                    Text("百度风控较严：同一账号短时间内大量取链容易触发限速（errno=118）或验证码（-62），建议小批量下载。")
+                    Text("夸克/UC 的 Cookie 里要有 __pus 和 __puus，否则取不到直链。")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Text("下载保存位置：文件 App › 我的 iPhone › 云析")

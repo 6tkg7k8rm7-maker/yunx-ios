@@ -1,7 +1,24 @@
 import SwiftUI
+import UIKit
+
+struct SharePayload: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct ActivityView: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
 
 struct DownloadsView: View {
     @ObservedObject private var downloader = Downloader.shared
+    @State private var share: SharePayload?
 
     var body: some View {
         NavigationStack {
@@ -17,7 +34,10 @@ struct DownloadsView: View {
             }
             .navigationTitle("下载")
             .toolbar {
-                Button("清理已完成") { downloader.clearFinished() }
+                Button("清理已结束") { downloader.clearFinished() }
+            }
+            .sheet(item: $share) { payload in
+                ActivityView(items: [payload.url])
             }
             .safeAreaInset(edge: .bottom) {
                 Text("文件位置：文件 App › 我的 iPhone › 云析")
@@ -42,7 +62,9 @@ struct DownloadsView: View {
                     .font(.caption)
                     .foregroundColor(task.state == "失败" ? .red : .secondary)
             }
+
             ProgressView(value: task.progress)
+
             HStack {
                 if task.total > 0 {
                     Text(ByteCountFormatter.string(fromByteCount: task.total, countStyle: .file))
@@ -56,26 +78,48 @@ struct DownloadsView: View {
                         .foregroundColor(.accentColor)
                 }
             }
+
             if let error = task.error {
                 Text(error)
                     .font(.caption2)
                     .foregroundColor(.red)
             }
-            if let url = task.fileURL {
-                HStack(spacing: 14) {
-                    ShareLink(item: url) {
-                        Label("导出到「文件」", systemImage: "square.and.arrow.up")
-                            .font(.caption)
-                    }
-                    Spacer()
-                    Button(role: .destructive) {
-                        downloader.delete(task)
+
+            HStack(spacing: 10) {
+                if task.fileURL != nil {
+                    Button {
+                        if let url = task.fileURL { share = SharePayload(url: url) }
                     } label: {
-                        Image(systemName: "trash").font(.caption)
+                        Label("导出", systemImage: "square.and.arrow.up").font(.caption)
                     }
+                    .buttonStyle(.borderedProminent)
+                } else if task.paused {
+                    Button {
+                        downloader.resume(task)
+                    } label: {
+                        Label("继续", systemImage: "play.fill").font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Button {
+                        downloader.pause(task)
+                    } label: {
+                        Label("暂停", systemImage: "pause.fill").font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(task.state == "已完成" || task.state == "失败")
                 }
+
+                Button(role: .destructive) {
+                    downloader.remove(task)
+                } label: {
+                    Label("删除", systemImage: "trash").font(.caption)
+                }
+                .buttonStyle(.bordered)
+
+                Spacer()
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
     }
 }

@@ -11,32 +11,39 @@ struct DlTask: Identifiable {
     var error: String?
     var speed: String = ""
     var total: Int64 = 0
+    var paused: Bool = false
 }
 
-/// 多连接分片下载：
-/// 先探测大小与 Range 支持，支持就切成若干段并发拉，最后按顺序合并成一个文件；
-/// 不支持 Range（或文件很小）就退回单连接。文件落在 App 的 Documents，文件 App 里可见。
+/// 多连接分片下载，支持暂停 / 继续 / 删除。
+/// 每段落到临时分片文件，暂停后保留分片，继续时按已下载字节续传，全部完成再合并。
 final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
 
     static let shared = Downloader()
 
-    /// 并发分片数（可在设置页改）
     var connections: Int = 6
 
     @Published private(set) var tasks: [DlTask] = []
 
-    private struct PartRef {
-        let id: UUID
-        let index: Int
+    private struct PartPlan {
+        let range: ClosedRange<Int64>
+        let file: URL
+        var have: Int64 = 0
     }
 
-    private var refs: [Int: PartRef] = [:]
-    private var partFiles: [UUID: [Int: URL]] = [:]
-    private var partRanges: [UUID: [ClosedRange<Int64>]] = [:]
-    private var received: [UUID: [Int: Int64]] = [:]
-    private var totals: [UUID: Int64] = [:]
-    private var lastSpeed: [UUID: (time: Date, bytes: Int64)] = [:]
-    private var started: [UUID: (name: String, url: URL, headers: [String: String], dir: URL)] = [:]
+    private struct Meta {
+        let name: String
+        let dir: URL
+        let total: Int64
+        let url: URL
+        let headers: [String: String]
+    }
+
+    private var plans: [UUID: [PartPlan]] = [:]
+    private var metas: [UUID: Meta] = [:]
+    private var taskMap: [Int: (id: UUID, index: Int)] = [:]
+    private var written: [UUID: [Int: Int64]] = [:]
+    private var pausedIDs = Set<UUID>()
+    private var lastTick: [UUID: (Date, Int64)] = [:]
     private let lock = NSLock()
     private var backgroundID: UIBackgroundTaskIdentifier = .invalid
 
@@ -57,85 +64,131 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
             self.tasks.insert(DlTask(id: id, name: safe, progress: 0, state: "准备中", fileURL: nil, error: nil), at: 0)
             self.keepAlive()
         }
-        Task { await self.begin(id: id, name: safe, link: link) }
+        Task { await prepare(id: id, name: safe, link: link) }
+    }
+
+    func pause(_ task: DlTask) {
+        pause(id: task.id)
+    }
+
+    func resume(_ task: DlTask) {
+        lock.lock()
+        pausedIDs.remove(task.id)
+        lock.unlock()
+        update(id: task.id) { item in
+            item.state = "下载中"
+            item.paused = false
+            item.error = nil
+        }
+        launch(id: task.id)
+        keepAlive()
+    }
+
+    func remove(_ task: DlTask) {
+        pause(id: task.id)
+        lock.lock()
+        let meta = metas[task.id]
+        let parts = plans[task.id] ?? []
+        plans.removeValue(forKey: task.id)
+        metas.removeValue(forKey: task.id)
+        written.removeValue(forKey: task.id)
+        lock.unlock()
+        if let meta {
+            try? FileManager.default.removeItem(at: meta.dir)
+        }
+        for part in parts { try? FileManager.default.removeItem(at: part.file) }
+        if let url = task.fileURL { try? FileManager.default.removeItem(at: url) }
+        DispatchQueue.main.async {
+            self.tasks.removeAll { $0.id == task.id }
+            self.releaseIfIdle()
+        }
     }
 
     func clearFinished() {
         tasks.removeAll { $0.state == "已完成" || $0.state == "失败" }
     }
 
-    func delete(_ task: DlTask) {
-        if let url = task.fileURL {
-            try? FileManager.default.removeItem(at: url)
+    private func pause(id: UUID) {
+        lock.lock()
+        pausedIDs.insert(id)
+        let ids = taskMap.filter { $0.value.id == id }.map { $0.key }
+        lock.unlock()
+        for key in ids {
+            session.task(withIdentifier: key)?.cancel()
         }
-        tasks.removeAll { $0.id == task.id }
+        update(id: id) { item in
+            if item.state != "已完成" { item.state = "已暂停"; item.paused = true }
+            item.speed = ""
+        }
+        releaseIfIdle()
     }
 
-    // MARK: - 流程
+    // MARK: - 准备
 
-    private func begin(id: UUID, name: String, link: DirectLink) async {
+    private func prepare(id: UUID, name: String, link: DirectLink) async {
         let probe = await probe(link: link)
         let size = probe.size
-        let useParts = probe.ranged && size > 2 * 1024 * 1024
-
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(id.uuidString)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
-        lock.lock()
-        started[id] = (name: name, url: link.url, headers: link.headers, dir: dir)
-        totals[id] = size
-        lock.unlock()
-
-        if useParts {
+        var ranges: [ClosedRange<Int64>]
+        if probe.ranged && size > 2 * 1024 * 1024 {
             let count = max(2, min(connections, 8))
-            var ranges: [ClosedRange<Int64>] = []
             let chunk = size / Int64(count)
+            ranges = []
             var start: Int64 = 0
             for index in 0..<count {
                 let end = index == count - 1 ? size - 1 : start + chunk - 1
                 ranges.append(start...end)
                 start = end + 1
             }
-            lock.lock()
-            partRanges[id] = ranges
-            var map: [Int: Int64] = [:]
-            for index in ranges.indices { map[index] = 0 }
-            received[id] = map
-            partFiles[id] = [:]
-            lock.unlock()
-
-            update(id: id) { task in
-                task.state = "下载中（\(ranges.count) 线程）"
-                task.total = size
-            }
-
-            for (index, range) in ranges.enumerated() {
-                var request = URLRequest(url: link.url)
-                for (key, value) in link.headers { request.setValue(value, forHTTPHeaderField: key) }
-                request.setValue("bytes=\(range.lowerBound)-\(range.upperBound)", forHTTPHeaderField: "Range")
-                let downloadTask = session.downloadTask(with: request)
-                lock.lock()
-                refs[downloadTask.taskIdentifier] = PartRef(id: id, index: index)
-                lock.unlock()
-                downloadTask.resume()
-            }
         } else {
-            var request = URLRequest(url: link.url)
-            for (key, value) in link.headers { request.setValue(value, forHTTPHeaderField: key) }
-            let downloadTask = session.downloadTask(with: request)
-            lock.lock()
-            refs[downloadTask.taskIdentifier] = PartRef(id: id, index: 0)
-            partRanges[id] = [0...(max(size, 1) - 1)]
-            received[id] = [0: 0]
-            partFiles[id] = [:]
+            ranges = [0...(max(size, 1) - 1)]
+        }
+
+        lock.lock()
+        metas[id] = Meta(name: name, dir: dir, total: size, url: link.url, headers: link.headers)
+        plans[id] = ranges.enumerated().map { index, range in
+            PartPlan(range: range, file: dir.appendingPathComponent("part-\(index)"))
+        }
+        written[id] = [:]
+        lock.unlock()
+
+        update(id: id) { item in
+            item.state = ranges.count > 1 ? "下载中（\(ranges.count) 线程）" : "下载中"
+            item.total = size
+            item.paused = false
+        }
+        launch(id: id)
+    }
+
+    private func launch(id: UUID) {
+        lock.lock()
+        guard let parts = plans[id], let meta = metas[id] else {
             lock.unlock()
-            update(id: id) { task in
-                task.state = "下载中"
-                task.total = size
+            return
+        }
+        var started = 0
+        for (index, part) in parts.enumerated() {
+            let length = part.range.upperBound - part.range.lowerBound + 1
+            guard part.have < length else { continue }
+            let start = part.range.lowerBound + part.have
+            var request = URLRequest(url: meta.url)
+            for (key, value) in meta.headers { request.setValue(value, forHTTPHeaderField: key) }
+            if meta.total > 0 {
+                request.setValue("bytes=\(start)-\(part.range.upperBound)", forHTTPHeaderField: "Range")
             }
+            let downloadTask = session.downloadTask(with: request)
+            taskMap[downloadTask.taskIdentifier] = (id, index)
+            started += 1
             downloadTask.resume()
         }
+        lock.unlock()
+
+        if started == 0 { mergeIfComplete(id: id) }
     }
+
+    // MARK: - 探测
 
     private func probe(link: DirectLink) async -> (size: Int64, ranged: Bool) {
         var head = URLRequest(url: link.url)
@@ -171,33 +224,39 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
                     didWriteData bytesWritten: Int64,
                     totalBytesWritten: Int64,
                     totalBytesExpectedToWrite: Int64) {
-        guard let ref = reference(downloadTask.taskIdentifier) else { return }
-        let done: Int64
-        let total: Int64
         lock.lock()
-        var map = received[ref.id] ?? [:]
+        guard let ref = taskMap[downloadTask.taskIdentifier] else {
+            lock.unlock()
+            return
+        }
+        var map = written[ref.id] ?? [:]
         map[ref.index] = totalBytesWritten
-        received[ref.id] = map
-        done = map.values.reduce(0, +)
-        total = totals[ref.id] ?? 0
+        written[ref.id] = map
+
+        let parts = plans[ref.id] ?? []
+        let haveSum = parts.reduce(Int64(0)) { $0 + $1.have }
+        let writtenSum = map.values.reduce(Int64(0), +)
+        let total = metas[ref.id]?.total ?? 0
         lock.unlock()
 
         var speedText = ""
-        if let last = lastSpeed[ref.id] {
-            let dt = Date().timeIntervalSince(last.time)
+        let now = Date()
+        if let last = lastTick[ref.id] {
+            let dt = now.timeIntervalSince(last.0)
             if dt >= 1.0 {
-                let delta = done - last.bytes
+                let delta = haveSum + writtenSum - last.1
                 speedText = ByteCountFormatter.string(fromByteCount: Int64(Double(delta) / dt), countStyle: .file) + "/s"
-                lastSpeed[ref.id] = (Date(), done)
+                lastTick[ref.id] = (now, haveSum + writtenSum)
             }
         } else {
-            lastSpeed[ref.id] = (Date(), done)
+            lastTick[ref.id] = (now, haveSum + writtenSum)
         }
 
-        update(id: ref.id) { task in
-            if total > 0 { task.progress = min(max(Double(done) / Double(total), 0), 0.995) }
-            task.total = total
-            if !speedText.isEmpty { task.speed = speedText }
+        update(id: ref.id) { item in
+            if total > 0 {
+                item.progress = min(max(Double(haveSum + writtenSum) / Double(total), 0), 0.995)
+            }
+            if !speedText.isEmpty { item.speed = speedText }
         }
     }
 
@@ -205,59 +264,90 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
                     downloadTask: URLSessionDownloadTask,
                     didFinishDownloadingTo location: URL) {
         let key = downloadTask.taskIdentifier
-        guard let ref = reference(key) else { return }
-
         lock.lock()
-        let dir = started[ref.id]?.dir ?? FileManager.default.temporaryDirectory
-        let partURL = dir.appendingPathComponent("part-\(ref.index)")
+        guard let ref = taskMap[key], var parts = plans[ref.id], ref.index < parts.count else {
+            taskMap.removeValue(forKey: key)
+            lock.unlock()
+            return
+        }
+        let part = parts[ref.index]
+        let dir = metas[ref.id]?.dir ?? FileManager.default.temporaryDirectory
+        let incoming = dir.appendingPathComponent("incoming-\(ref.index)-\(UUID().uuidString)")
+        taskMap.removeValue(forKey: key)
         lock.unlock()
 
         do {
-            if FileManager.default.fileExists(atPath: partURL.path) {
-                try FileManager.default.removeItem(at: partURL)
+            try FileManager.default.moveItem(at: location, to: incoming)
+            if FileManager.default.fileExists(atPath: part.file.path) {
+                // 续传：把新片段追加到已有分片后面
+                let handle = try FileHandle(forWritingTo: part.file)
+                handle.seekToEndOfFile()
+                let input = try FileHandle(forReadingFrom: incoming)
+                while let chunk = try input.read(upToCount: 1 << 20), !chunk.isEmpty {
+                    handle.write(chunk)
+                }
+                try input.close()
+                try handle.close()
+                try FileManager.default.removeItem(at: incoming)
+            } else {
+                try FileManager.default.moveItem(at: incoming, to: part.file)
             }
-            try FileManager.default.moveItem(at: location, to: partURL)
+            let attributes = try? FileManager.default.attributesOfItem(atPath: part.file.path)
+            let size = (attributes?[.size] as? Int64) ?? 0
             lock.lock()
-            var files = partFiles[ref.id] ?? [:]
-            files[ref.index] = partURL
-            partFiles[ref.id] = files
-            let finished = files.count
-            let expected = partRanges[ref.id]?.count ?? 1
+            parts[ref.index].have = size
+            plans[ref.id] = parts
+            var map = written[ref.id] ?? [:]
+            map.removeValue(forKey: ref.index)
+            written[ref.id] = map
             lock.unlock()
-            forget(key)
-
-            if finished >= expected {
-                merge(id: ref.id)
-            }
+            mergeIfComplete(id: ref.id)
         } catch {
             fail(id: ref.id, message: "保存分片失败：\(error.localizedDescription)")
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let error = error, let ref = reference(task.taskIdentifier) else {
-            forget(task.taskIdentifier)
+        let key = task.taskIdentifier
+        guard let error = error else {
+            lock.lock(); taskMap.removeValue(forKey: key); lock.unlock()
             return
         }
-        fail(id: ref.id, message: error.localizedDescription)
-        forget(task.taskIdentifier)
+        lock.lock()
+        let ref = taskMap[key]
+        let paused = ref.map { pausedIDs.contains($0.id) } ?? false
+        taskMap.removeValue(forKey: key)
+        lock.unlock()
+        if !paused, let ref {
+            fail(id: ref.id, message: error.localizedDescription)
+        }
     }
 
     // MARK: - 合并
 
-    private func merge(id: UUID) {
+    private func mergeIfComplete(id: UUID) {
         lock.lock()
-        guard let info = started[id], let files = partFiles[id] else {
+        guard let meta = metas[id], let parts = plans[id] else {
             lock.unlock()
             return
         }
-        let ranges = partRanges[id] ?? []
+        let complete = parts.allSatisfy { part -> Bool in
+            let attributes = try? FileManager.default.attributesOfItem(atPath: part.file.path)
+            let size = (attributes?[.size] as? Int64) ?? 0
+            if meta.total <= 0 { return size > 0 }
+            let length = part.range.upperBound - part.range.lowerBound + 1
+            return size >= length
+        }
+        guard complete else {
+            lock.unlock()
+            return
+        }
         lock.unlock()
 
         DispatchQueue.global(qos: .utility).async {
             let fm = FileManager.default
             guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
-            let target = docs.appendingPathComponent(info.name)
+            let target = docs.appendingPathComponent(meta.name)
             try? fm.removeItem(at: target)
             fm.createFile(atPath: target.path, contents: nil)
             guard let handle = try? FileHandle(forWritingTo: target) else {
@@ -265,18 +355,22 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
                 return
             }
             do {
-                for index in 0..<max(ranges.count, files.count) {
-                    guard let part = files[index], fm.fileExists(atPath: part.path) else { continue }
-                    let input = try FileHandle(forReadingFrom: part)
+                for part in parts {
+                    let input = try FileHandle(forReadingFrom: part.file)
                     while let chunk = try input.read(upToCount: 1 << 20), !chunk.isEmpty {
                         try handle.write(contentsOf: chunk)
                     }
                     try input.close()
                 }
                 try handle.close()
-                try? fm.removeItem(at: info.dir)
+                try? fm.removeItem(at: meta.dir)
                 let attributes = try? fm.attributesOfItem(atPath: target.path)
                 let finalSize = (attributes?[.size] as? Int64) ?? 0
+                self.lock.lock()
+                self.plans.removeValue(forKey: id)
+                self.metas.removeValue(forKey: id)
+                self.written.removeValue(forKey: id)
+                self.lock.unlock()
                 DispatchQueue.main.async {
                     if let index = self.tasks.firstIndex(where: { $0.id == id }) {
                         self.tasks[index].progress = 1
@@ -284,6 +378,7 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
                         self.tasks[index].fileURL = target
                         self.tasks[index].total = finalSize
                         self.tasks[index].speed = ""
+                        self.tasks[index].paused = false
                     }
                     self.releaseIfIdle()
                 }
@@ -294,15 +389,6 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
     }
 
     // MARK: - 工具
-
-    private func reference(_ key: Int) -> PartRef? {
-        lock.lock(); defer { lock.unlock() }
-        return refs[key]
-    }
-
-    private func forget(_ key: Int) {
-        lock.lock(); refs.removeValue(forKey: key); lock.unlock()
-    }
 
     private func update(id: UUID, _ change: @escaping (inout DlTask) -> Void) {
         DispatchQueue.main.async {
@@ -317,6 +403,7 @@ final class Downloader: NSObject, ObservableObject, URLSessionDownloadDelegate {
             if let index = self.tasks.firstIndex(where: { $0.id == id }) {
                 self.tasks[index].state = "失败"
                 self.tasks[index].error = message
+                self.tasks[index].speed = ""
             }
             self.releaseIfIdle()
         }

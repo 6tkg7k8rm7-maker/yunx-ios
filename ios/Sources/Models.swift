@@ -33,7 +33,30 @@ enum Platform: String, CaseIterable, Identifiable, Hashable {
     }
 
     var loginURL: URL {
-        URL(string: referer)!
+        URL(string: loginURLString)!
+    }
+
+    /// 登录页地址：夸克/百度首页往下滑有登录区；UC 直接用微信扫码登录页
+    var loginURLString: String {
+        switch self {
+        case .quark: return "https://pan.quark.cn/"
+        case .uc: return "https://drive.uc.cn/account/wxlogin"
+        case .baidu: return "https://pan.baidu.com/"
+        }
+    }
+
+    /// 登录页提示
+    var loginHint: String {
+        switch self {
+        case .quark: return "页面往下滑，找到「登录账号」区域；也可以点下面「跳到登录区」"
+        case .uc: return "用微信扫码登录；扫不了就回到 drive.uc.cn 首页找手机号登录"
+        case .baidu: return "账号密码或扫码都行，登录后点右上角「完成」"
+        }
+    }
+
+    /// 需要滚动定位的锚点（夸克页面里的登录区 id）
+    var loginAnchor: String? {
+        self == .quark ? "登录账号" : nil
     }
 
     var cookieHost: String {
@@ -58,6 +81,12 @@ enum Platform: String, CaseIterable, Identifiable, Hashable {
         case .baidu:
             return BaiduClient.webUA
         }
+    }
+
+    /// 登录网页用的浏览器 UA（客户端 UA 会被当成 App 内浏览器，页面会跳下载页）
+    var webBrowserUA: String {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            + "Chrome/124.0.0.0 Safari/537.36"
     }
 }
 

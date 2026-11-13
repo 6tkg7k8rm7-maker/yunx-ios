@@ -1,43 +1,96 @@
 import SwiftUI
 import WebKit
 
+/// 包一层 WKWebView，给登录页提供 后退/刷新/跳到登录区
+final class WebController: ObservableObject {
+    weak var webView: WKWebView?
+    @Published var canBack = false
+    @Published var canForward = false
+    @Published var loading = false
+
+    func back() { webView?.goBack() }
+    func forward() { webView?.goForward() }
+    func reload() { webView?.reload() }
+    func load(_ url: URL) { webView?.load(URLRequest(url: url)) }
+
+    /// 夸克页面是营销页 + 登录卡片，直接滚到「登录账号」区域
+    func scrollToAnchor(_ anchor: String) {
+        let js = """
+        (function(){
+          var el = document.getElementById('\(anchor)');
+          if (!el) {
+            var all = document.querySelectorAll('div,section,span,h1,h2,h3');
+            for (var i = 0; i < all.length; i++) {
+              if ((all[i].textContent || '').trim() === '\(anchor)') { el = all[i]; break; }
+            }
+          }
+          if (el) { el.scrollIntoView({block: 'center'}); }
+        })();
+        """
+        webView?.evaluateJavaScript(js)
+    }
+}
+
 struct LoginSheet: View {
     let platform: Platform
     let onFinish: () -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var controller = WebController()
     @State private var progress = 0.0
     @State private var capturing = false
     @State private var message: String?
 
     var body: some View {
         NavigationStack {
-            ZStack(alignment: .top) {
-                WebView(url: platform.loginURL,
-                        progress: $progress,
-                        onCookies: { cookies in
-                            // 每次页面加载完都顺手抓一次，避免用户点「完成」时还没同步
-                            let header = Self.header(from: cookies, platform: platform)
-                            if !header.isEmpty {
-                                CookieStore.save(header, for: platform)
-                            }
-                        })
-                    .ignoresSafeArea(edges: .bottom)
-                if progress < 1.0 {
-                    ProgressView(value: progress)
-                        .progressViewStyle(.linear)
-                        .tint(.accentColor)
+            VStack(spacing: 0) {
+                HStack(spacing: 18) {
+                    Button { controller.back() } label: { Image(systemName: "chevron.left") }
+                        .disabled(!controller.canBack)
+                    Button { controller.forward() } label: { Image(systemName: "chevron.right") }
+                        .disabled(!controller.canForward)
+                    Button { controller.reload() } label: { Image(systemName: "arrow.clockwise") }
+                    Button("首页") {
+                        if let home = URL(string: platform.referer) { controller.load(home) }
+                    }
+                    .font(.caption)
+                    Spacer()
+                    if let anchor = platform.loginAnchor {
+                        Button("跳到登录区") { controller.scrollToAnchor(anchor) }
+                            .font(.caption)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.bar)
+
+                ZStack(alignment: .top) {
+                    WebView(url: platform.loginURL,
+                            progress: $progress,
+                            controller: controller,
+                            userAgent: platform.webBrowserUA,
+                            onCookies: { cookies in
+                                let header = Self.header(from: cookies, platform: platform)
+                                if !header.isEmpty {
+                                    CookieStore.save(header, for: platform)
+                                }
+                            })
+                    if progress < 1.0 {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                            .tint(.accentColor)
+                    }
                 }
             }
             .safeAreaInset(edge: .bottom) {
-                if let message {
-                    Text(message)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(message ?? platform.loginHint)
                         .font(.caption)
-                        .foregroundColor(.orange)
-                        .padding(8)
-                        .frame(maxWidth: .infinity)
-                        .background(.thinMaterial)
+                        .foregroundColor(message == nil ? .secondary : .orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .padding(8)
+                .background(.thinMaterial)
             }
             .navigationTitle("登录 \(platform.title)")
             .navigationBarTitleDisplayMode(.inline)
@@ -69,7 +122,7 @@ struct LoginSheet: View {
                     return
                 }
                 if let missing = CookieStore.missingKey(header, for: platform) {
-                    message = "抓到了 Cookie，但缺少登录态字段 \(missing)，可能还没登录成功。"
+                    message = "抓到 \(header.count) 字符，但缺少登录字段 \(missing)——说明还没真正登录成功。"
                     CookieStore.save(header, for: platform)
                     return
                 }
@@ -95,18 +148,24 @@ struct LoginSheet: View {
 struct WebView: UIViewRepresentable {
     let url: URL
     @Binding var progress: Double
+    var controller: WebController?
+    var userAgent: String?
     var onCookies: ([HTTPCookie]) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(progress: $progress, onCookies: onCookies)
+        Coordinator(progress: $progress, onCookies: onCookies, controller: controller)
     }
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         let webView = WKWebView(frame: .zero, configuration: config)
+        if let userAgent {
+            webView.customUserAgent = userAgent
+        }
         webView.navigationDelegate = context.coordinator
-        context.coordinator.startObserving(webView)
+        context.coordinator.attach(webView)
+        controller?.webView = webView
         webView.load(URLRequest(url: url))
         return webView
     }
@@ -116,25 +175,49 @@ struct WebView: UIViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate {
         private let progress: Binding<Double>
         private let onCookies: ([HTTPCookie]) -> Void
-        private var observation: NSKeyValueObservation?
+        private weak var controller: WebController?
+        private var observations: [NSKeyValueObservation] = []
 
-        init(progress: Binding<Double>, onCookies: @escaping ([HTTPCookie]) -> Void) {
+        init(progress: Binding<Double>, onCookies: @escaping ([HTTPCookie]) -> Void, controller: WebController?) {
             self.progress = progress
             self.onCookies = onCookies
+            self.controller = controller
         }
 
-        func startObserving(_ webView: WKWebView) {
-            observation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] view, _ in
+        func attach(_ webView: WKWebView) {
+            observations.append(webView.observe(\.estimatedProgress, options: [.new]) { [weak self] view, _ in
                 DispatchQueue.main.async {
                     self?.progress.wrappedValue = view.estimatedProgress
                 }
-            }
+            })
+            observations.append(webView.observe(\.canGoBack, options: [.new]) { [weak self] view, _ in
+                DispatchQueue.main.async {
+                    self?.controller?.canBack = view.canGoBack
+                }
+            })
+            observations.append(webView.observe(\.canGoForward, options: [.new]) { [weak self] view, _ in
+                DispatchQueue.main.async {
+                    self?.controller?.canForward = view.canGoForward
+                }
+            })
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
                 self?.onCookies(cookies)
             }
+            DispatchQueue.main.async {
+                self.controller?.canBack = webView.canGoBack
+                self.controller?.canForward = webView.canGoForward
+            }
+        }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            DispatchQueue.main.async {
+                self.controller?.canBack = webView.canGoBack
+                self.controller?.canForward = webView.canGoForward
+            }
         }
     }
 }
+

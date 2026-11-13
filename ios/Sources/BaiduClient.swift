@@ -5,7 +5,10 @@ struct BaiduShareState {
     let surl: String
     let shareID: String
     let uk: String
+    /// 原始形式（可能含 %3D）：BDCLND Cookie 必须用它
     let sekey: String
+    /// 查询参数用：解码后交给 URLComponents 重新编码，避免二次编码
+    var sekeyQuery: String { sekey.removingPercentEncoding ?? sekey }
 }
 
 /// 百度网盘分享客户端（对齐 YunX-Desktop 的 BaiduApi.kt 链路）：
@@ -81,8 +84,8 @@ struct BaiduClient {
         guard let randsk = json["randsk"] as? String, !randsk.isEmpty else {
             throw AppError.message("验证提取码：没有返回 randsk")
         }
-        // randsk 是 URL 编码形式，解码后再交给 URLComponents 编码，避免二次编码
-        return randsk.removingPercentEncoding ?? randsk
+        // randsk 是 URL 编码形式：BDCLND Cookie 用原始值，查询参数用解码值
+        return randsk
     }
 
     // MARK: - 2. 列目录
@@ -104,7 +107,9 @@ struct BaiduClient {
             ("root", isRoot ? "1" : "0"),
             ("dir", dir.isEmpty ? "/" : dir)
         ]
-        if !sekey.isEmpty { items.append(("sekey", sekey)) }
+        if !sekey.isEmpty {
+            items.append(("sekey", sekey.removingPercentEncoding ?? sekey))
+        }
 
         var request = URLRequest(url: url("https://pan.baidu.com/rest/2.0/xpan/share", items))
         request.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
@@ -160,7 +165,7 @@ struct BaiduClient {
             ("bdstoken", token),
             ("clienttype", "0")
         ]
-        if !state.sekey.isEmpty { items.append(("sekey", state.sekey)) }
+        if !state.sekey.isEmpty { items.append(("sekey", state.sekeyQuery)) }
 
         var request = URLRequest(url: url("https://pan.baidu.com/share/transfer", items))
         request.httpMethod = "POST"

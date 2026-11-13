@@ -28,11 +28,8 @@ struct QuarkClient {
     // MARK: - 基础请求
 
     private func makeURL(_ path: String, _ query: [String: String] = [:]) -> URL {
-        var comp = URLComponents(string: platform.apiBase + path)!
-        if !query.isEmpty {
-            comp.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
-        }
-        return comp.url!
+        let pairs = query.keys.sorted().map { ($0, query[$0] ?? "") }
+        return Net.url(platform.apiBase + path, pairs)
     }
 
     private func decorate(_ request: inout URLRequest) {
@@ -86,7 +83,7 @@ struct QuarkClient {
         var result: [CloudFile] = []
         var page = 1
         while page <= 20 {
-            let json = try await get(detailPath, [
+            let params: [String: String] = [
                 "pr": pr,
                 "fr": "pc",
                 "pwd_id": shareID,
@@ -99,7 +96,18 @@ struct QuarkClient {
                 "_fetch_share": "1",
                 "_fetch_total": "1",
                 "_sort": "file_type:asc,updated_at:desc"
-            ], step: "列目录")
+            ]
+            let json: [String: Any]
+            do {
+                json = try await get(detailPath, params, step: "列目录")
+            } catch {
+                // UC 的 v2/detail 偶尔回 405，退回 v1 路径再试一次
+                if platform == .uc {
+                    json = try await get("/1/clouddrive/share/sharepage/detail", params, step: "列目录(v1)")
+                } else {
+                    throw error
+                }
+            }
             let data = json["data"] as? [String: Any] ?? [:]
             let items = data["list"] as? [[String: Any]] ?? []
             for item in items {

@@ -52,6 +52,20 @@ enum Net {
         return URLSession(configuration: cfg)
     }()
 
+    /// RFC3986 严格编码：`+` `/` `=` `&` 都必须转义，否则服务端把 `+` 当空格、`/` 当路径分隔
+    static func encode(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    /// 用严格编码拼 URL（URLComponents 默认不转义 `+` 和 `/`，会破坏 stoken/sekey）
+    static func url(_ base: String, _ query: [(String, String)]) -> URL {
+        guard !query.isEmpty else { return URL(string: base)! }
+        let qs = query.map { "\(encode($0.0))=\(encode($0.1))" }.joined(separator: "&")
+        return URL(string: base + "?" + qs)!
+    }
+
     /// 发请求并解析 JSON；失败时把 HTTP 状态/响应片段写进日志
     static func json(_ request: URLRequest, platform: String, step: String) async throws -> [String: Any] {
         let method = request.httpMethod ?? "GET"

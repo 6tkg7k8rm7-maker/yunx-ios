@@ -27,9 +27,7 @@ struct BaiduClient {
     // MARK: - 基础
 
     private func url(_ base: String, _ items: [(String, String)]) -> URL {
-        var comp = URLComponents(string: base)!
-        comp.queryItems = items.map { URLQueryItem(name: $0.0, value: $0.1) }
-        return comp.url!
+        Net.url(base, items)
     }
 
     private func authCookie(sekey: String?) -> String {
@@ -174,7 +172,7 @@ struct BaiduClient {
         request.setValue("https://pan.baidu.com", forHTTPHeaderField: "Origin")
         request.setValue("https://pan.baidu.com/s/", forHTTPHeaderField: "Referer")
         request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
-        let body = "fsidlist=%5B%22\(fsID)%22%5D&path=\(toDir.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "%2F")"
+        let body = "fsidlist=%5B%22\(fsID)%22%5D&path=\(Net.encode(toDir))"
         request.httpBody = body.data(using: .utf8)
 
         let json = try await Net.json(request, platform: "BAIDU", step: "转存")
@@ -266,10 +264,41 @@ struct BaiduClient {
         try await list(surl: state.surl, sekey: state.sekey, dir: dir).files
     }
 
-    /// 取直链：转存到根目录 → locatedownload
+    /// 取直链：建临时目录 → 转存 → locatedownload
     func direct(state: BaiduShareState, fsID: String) async throws -> DirectLink {
-        let path = try await transfer(state: state, fsID: fsID, toDir: "/")
+        let dir = try await ensureTransferDir()
+        let path = try await transfer(state: state, fsID: fsID, toDir: dir)
         return try await locatedownload(path: path)
+    }
+
+    static let transferDir = "/云析下载"
+
+    /// 百度不接受转存到根目录（errno=2），必须先有一个真实目录
+    func ensureTransferDir() async throws -> String {
+        let token = try await bdstoken()
+        let target = url("https://pan.baidu.com/api/create", [
+            ("a", "commit"), ("channel", "chunlei"), ("web", "1"),
+            ("app_id", Self.appID), ("clienttype", "0"), ("bdstoken", token)
+        ])
+        var request = URLRequest(url: target)
+        request.httpMethod = "POST"
+        request.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("https://pan.baidu.com/disk/main", forHTTPHeaderField: "Referer")
+        request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        let body = "path=\(Net.encode(Self.transferDir))&isdir=1&size&block_list=%5B%5D&method=post&dataType=json"
+        request.httpBody = body.data(using: .utf8)
+        do {
+            let json = try await Net.json(request, platform: "BAIDU", step: "建转存目录")
+            let errno = (json["errno"] as? NSNumber)?.intValue ?? 0
+            // -8 = 目录已存在，属于正常
+            if errno != 0 && errno != -8 {
+                RequestLog.add("BAIDU", step: "建转存目录", detail: "errno=\(errno)，继续尝试转存", ok: false)
+            }
+        } catch {
+            RequestLog.add("BAIDU", step: "建转存目录", detail: error.localizedDescription, ok: false)
+        }
+        return Self.transferDir
     }
 
     // MARK: - 错误码

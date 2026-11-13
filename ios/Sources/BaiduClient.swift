@@ -7,12 +7,13 @@ struct BaiduShareState {
     let uk: String
     /// 原始形式（可能含 %3D）：BDCLND Cookie 必须用它
     let sekey: String
-    /// 查询参数用：解码后交给 URLComponents 重新编码，避免二次编码
+    /// 查询参数用：解码后交给严格编码，避免二次编码
     var sekeyQuery: String { sekey.removingPercentEncoding ?? sekey }
 }
 
 /// 百度网盘分享客户端（对齐 YunX-Desktop 的 BaiduApi.kt 链路）：
 /// bdstoken → share/verify → xpan/share(method=list) → share/transfer → locatedownload
+/// 转存失败时回退：share/tplconfig 取 sign → api/sharedownload
 struct BaiduClient {
 
     let cookie: String
@@ -21,6 +22,7 @@ struct BaiduClient {
         + "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     static let netdiskUA = "netdisk;12.24.6;piano;android-android;16;JSbridge4.4.0;jointBridge;1.1.0"
     static let appID = "250528"
+    static let transferDir = "/云析下载"
 
     private static var cachedBdstoken: String?
 
@@ -30,13 +32,16 @@ struct BaiduClient {
         Net.url(base, items)
     }
 
-    private func authCookie(sekey: String?) -> String {
+    private func withSekey(_ cookie: String, _ sekey: String) -> String {
         var value = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let sekey, !sekey.isEmpty, !value.contains("BDCLND=") {
-            if !value.isEmpty { value += "; " }
-            value += "BDCLND=\(sekey)"
-        }
+        guard !sekey.isEmpty, !value.contains("BDCLND=") else { return value }
+        if !value.isEmpty { value += "; " }
+        value += "BDCLND=\(sekey)"
         return value
+    }
+
+    static func clearCache() {
+        cachedBdstoken = nil
     }
 
     // MARK: - bdstoken
@@ -60,10 +65,6 @@ struct BaiduClient {
         return token
     }
 
-    static func clearCache() {
-        cachedBdstoken = nil
-    }
-
     // MARK: - 1. 提取码
 
     func verify(surl: String, pwd: String) async throws -> String {
@@ -82,7 +83,6 @@ struct BaiduClient {
         guard let randsk = json["randsk"] as? String, !randsk.isEmpty else {
             throw AppError.message("验证提取码：没有返回 randsk")
         }
-        // randsk 是 URL 编码形式：BDCLND Cookie 用原始值，查询参数用解码值
         return randsk
     }
 
@@ -111,7 +111,7 @@ struct BaiduClient {
 
         var request = URLRequest(url: url("https://pan.baidu.com/rest/2.0/xpan/share", items))
         request.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
-        request.setValue(authCookie(sekey: sekey), forHTTPHeaderField: "Cookie")
+        request.setValue(withSekey(cookie, sekey), forHTTPHeaderField: "Cookie")
         request.setValue("https://pan.baidu.com/s/\(surl)", forHTTPHeaderField: "Referer")
 
         let json = try await Net.json(request, platform: "BAIDU", step: "列目录")
@@ -149,25 +149,25 @@ struct BaiduClient {
         )
     }
 
+    func listSub(state: BaiduShareState, dir: String) async throws -> [CloudFile] {
+        try await list(surl: state.surl, sekey: state.sekey, dir: dir).files
+    }
+
     // MARK: - 3. 转存
 
-    /// 百度对 sekey 的编码处理在不同链路上不一致：查询参数可能要求原始编码串，
-    /// Cookie 里的 BDCLND 可能要求解码值。这里按三种组合依次重试，命中即返回。
+    private enum SekeyUse { case decoded, raw, none }
+
+    /// 百度对 sekey 的编码在两处不一致：这里按三种组合依次重试，命中即返回
     func transfer(state: BaiduShareState, fsID: String, toDir: String) async throws -> String {
         var lastError: Error?
-        // 组合 1：query=解码值，Cookie=原始值（理论上最正确）
         do { return try await transferOnce(state: state, fsID: fsID, toDir: toDir, query: .decoded, cookie: .raw) }
         catch { lastError = error }
-        // 组合 2：query=原始值（不再编码），Cookie=原始值
         do { return try await transferOnce(state: state, fsID: fsID, toDir: toDir, query: .raw, cookie: .raw) }
         catch { lastError = error }
-        // 组合 3：query 不带 sekey，Cookie=解码值
         do { return try await transferOnce(state: state, fsID: fsID, toDir: toDir, query: .none, cookie: .decoded) }
         catch { lastError = error }
         throw lastError ?? AppError.message("转存失败")
     }
-
-    private enum SekeyUse { case decoded, raw, none }
 
     private func transferOnce(state: BaiduShareState,
                               fsID: String,
@@ -215,12 +215,34 @@ struct BaiduClient {
         return to
     }
 
-    private func withSekey(_ cookie: String, _ sekey: String) -> String {
-        guard !sekey.isEmpty, !cookie.contains("BDCLND=") else { return cookie }
-        return cookie.isEmpty ? "BDCLND=\(sekey)" : "\(cookie); BDCLND=\(sekey)"
+    /// 百度不接受转存到根目录（errno=2），必须先有一个真实目录
+    func ensureTransferDir() async throws -> String {
+        do {
+            let token = try await bdstoken()
+            let target = url("https://pan.baidu.com/api/create", [
+                ("a", "commit"), ("channel", "chunlei"), ("web", "1"),
+                ("app_id", Self.appID), ("clienttype", "0"), ("bdstoken", token)
+            ])
+            var request = URLRequest(url: target)
+            request.httpMethod = "POST"
+            request.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+            request.setValue("https://pan.baidu.com/disk/main", forHTTPHeaderField: "Referer")
+            request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+            let body = "path=\(Net.encode(Self.transferDir))&isdir=1&size&block_list=%5B%5D&method=post&dataType=json"
+            request.httpBody = body.data(using: .utf8)
+            let json = try await Net.json(request, platform: "BAIDU", step: "建转存目录")
+            let errno = (json["errno"] as? NSNumber)?.intValue ?? 0
+            if errno != 0 && errno != -8 {
+                RequestLog.add("BAIDU", step: "建转存目录", detail: "errno=\(errno)，继续尝试", ok: false)
+            }
+        } catch {
+            RequestLog.add("BAIDU", step: "建转存目录", detail: error.localizedDescription, ok: false)
+        }
+        return Self.transferDir
     }
 
-    // MARK: - 4. 高速直链（locatedownload）
+    // MARK: - 4. locatedownload
 
     func locatedownload(path: String) async throws -> DirectLink {
         let time = Int(Date().timeIntervalSince1970)
@@ -232,7 +254,6 @@ struct BaiduClient {
             ("ant", "1"), ("check_blue", "1"), ("es", "1"), ("esl", "1"), ("apn_id", "1_-1"),
             ("freeisp", "0"), ("queryfree", "0"), ("use", "1"), ("dtype", "1"), ("eck", "1"), ("ehps", "1"),
             ("err_ver", "1.0"), ("network_type", "WIFI"), ("channel", "0"),
-            ("path", path),
             ("time", "\(time)"),
             ("rand", "5ed606e9da222cde0474cdf70eda884b"),
             ("devuid", "0F1E9FC2E084472DA5A61C4CF4C759AF"),
@@ -241,7 +262,8 @@ struct BaiduClient {
             ("psign", "860a071f77c860e8cea06e4e54c518f3"),
             ("version", "2.2.111.34"),
             ("version_app", "12.24.6"),
-            ("vip", "0")
+            ("vip", "0"),
+            ("path", path)
         ]
         items.removeAll { $0.0 == "path" }
         items.append(("path", path))
@@ -278,40 +300,7 @@ struct BaiduClient {
         ])
     }
 
-    // MARK: - 组合流程
-
-    func resolve(surl: String, pwd: String?) async throws -> (state: BaiduShareState, files: [CloudFile]) {
-        var sekey = ""
-        if let pwd, !pwd.isEmpty {
-            sekey = try await verify(surl: surl, pwd: pwd)
-        }
-        let result = try await list(surl: surl, sekey: sekey, dir: "/")
-        guard !result.shareID.isEmpty, !result.uk.isEmpty else {
-            throw AppError.message("百度分享解析失败：没拿到 share_id / uk")
-        }
-        let state = BaiduShareState(surl: surl, shareID: result.shareID, uk: result.uk, sekey: sekey)
-        return (state, result.files)
-    }
-
-    /// 列子目录（root=0，需要 BDCLND）
-    func listSub(state: BaiduShareState, dir: String) async throws -> [CloudFile] {
-        try await list(surl: state.surl, sekey: state.sekey, dir: dir).files
-    }
-
-    /// 取直链：优先「建目录 → 转存 → locatedownload」，
-    /// 失败则回退到「分享页 sign + sharedownload」（不占用户网盘空间）
-    func direct(state: BaiduShareState, fsID: String) async throws -> DirectLink {
-        do {
-            let dir = try await ensureTransferDir()
-            let path = try await transfer(state: state, fsID: fsID, toDir: dir)
-            return try await locatedownload(path: path)
-        } catch {
-            RequestLog.add("BAIDU", step: "转存链路失败", detail: error.localizedDescription + "，改用 sharedownload", ok: false)
-            return try await sharedDownload(state: state, fsID: fsID)
-        }
-    }
-
-    // MARK: - 3b. sharedownload（不走转存）
+    // MARK: - 5. sharedownload（不转存）
 
     private func firstMatch(_ pattern: String, in text: String) -> String? {
         guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
@@ -322,7 +311,7 @@ struct BaiduClient {
         return String(text[r])
     }
 
-    /// sign/timestamp：先用官方 tplconfig 接口（稳定），失败再退回解析分享页 HTML
+    /// sign/timestamp：先用官方 tplconfig 接口，失败再解析分享页 HTML
     func shareSign(state: BaiduShareState) async throws -> (sign: String, timestamp: String) {
         let target = url("https://pan.baidu.com/share/tplconfig", [
             ("surl", state.surl),
@@ -338,11 +327,10 @@ struct BaiduClient {
         if let json = try? await Net.json(request, platform: "BAIDU", step: "取 sign"),
            let data = json["data"] as? [String: Any],
            let sign = data["sign"] as? String,
-           let timestamp = (data["timestamp"] as? NSNumber)?.stringValue ?? data["timestamp"] as? String {
+           let timestamp = (data["timestamp"] as? NSNumber)?.stringValue ?? (data["timestamp"] as? String) {
             return (sign, timestamp)
         }
 
-        // 兜底：解析分享页 HTML
         let pageURL = URL(string: "https://pan.baidu.com/s/1\(state.surl)")!
         var pageRequest = URLRequest(url: pageURL)
         pageRequest.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
@@ -384,65 +372,7 @@ struct BaiduClient {
         ])
     }
 
-    // MARK: - 4. 高速直链（locatedownload）
-
-    func locatedownload(path: String) async throws -> DirectLink {
-        let time = Int(Date().timeIntervalSince1970)
-        var items: [(String, String)] = [
-            ("method", "locatedownload"),
-            ("app_id", Self.appID),
-            ("clienttype", "17"),
-            ("ver", "4.0"),
-            ("ant", "1"), ("check_blue", "1"), ("es", "1"), ("esl", "1"), ("apn_id", "1_-1"),
-            ("freeisp", "0"), ("queryfree", "0"), ("use", "1"), ("dtype", "1"), ("eck", "1"), ("ehps", "1"),
-            ("err_ver", "1.0"), ("network_type", "WIFI"), ("channel", "0"),
-            ("path", path),
-            ("time", "\(time)"),
-            ("rand", "5ed606e9da222cde0474cdf70eda884b"),
-            ("devuid", "0F1E9FC2E084472DA5A61C4CF4C759AF"),
-            ("cuid", "0F1E9FC2E084472DA5A61C4CF4C759AF"),
-            ("deviceid", "348642637967375013"),
-            ("psign", "860a071f77c860e8cea06e4e54c518f3"),
-            ("version", "2.2.111.34"),
-            ("version_app", "12.24.6"),
-            ("vip", "0")
-        ]
-        items.removeAll { $0.0 == "path" }
-        items.append(("path", path))
-
-        var request = URLRequest(url: url("https://d.pcs.baidu.com/rest/2.0/pcs/file", items))
-        request.httpMethod = "POST"
-        request.setValue(Self.netdiskUA, forHTTPHeaderField: "User-Agent")
-        request.setValue(cookie, forHTTPHeaderField: "Cookie")
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = "0".data(using: .utf8)
-
-        let json = try await Net.json(request, platform: "BAIDU", step: "取高速直链")
-        try Self.checkErrno(json)
-        let candidates = (json["urls"] as? [[String: Any]] ?? []).compactMap { item -> (String, Int)? in
-            guard let u = item["url"] as? String, !u.isEmpty else { return nil }
-            return (u, (item["encrypt"] as? NSNumber)?.intValue ?? 1)
-        }
-        let plain = candidates
-            .filter { $0.1 == 0 }
-            .sorted { lhs, rhs in
-                let l = lhs.0.hasPrefix("https") ? 0 : 1
-                let r = rhs.0.hasPrefix("https") ? 0 : 1
-                return l < r
-            }
-            .first
-        let chosen = plain ?? candidates.first(where: { $0.0.hasPrefix("https") }) ?? candidates.first
-        guard let picked = chosen, let dlURL = URL(string: picked.0) else {
-            throw AppError.message("取高速直链：没有返回可用地址")
-        }
-        return DirectLink(url: dlURL, headers: [
-            "User-Agent": Self.netdiskUA,
-            "Referer": "https://pan.baidu.com/",
-            "Cookie": cookie
-        ])
-    }
-
-    // MARK: - 组合流程
+    // MARK: - 6. 组合
 
     func resolve(surl: String, pwd: String?) async throws -> (state: BaiduShareState, files: [CloudFile]) {
         var sekey = ""
@@ -457,101 +387,17 @@ struct BaiduClient {
         return (state, result.files)
     }
 
-    /// 列子目录（root=0，需要 BDCLND）
-    func listSub(state: BaiduShareState, dir: String) async throws -> [CloudFile] {
-        try await list(surl: state.surl, sekey: state.sekey, dir: dir).files
-    }
-
-    /// 取直链：优先「建目录 → 转存 → locatedownload」，
-    /// 失败则回退到「分享页 sign + sharedownload」（不占用户网盘空间）
+    /// 优先「建目录 → 转存 → locatedownload」，失败回退 sharedownload
     func direct(state: BaiduShareState, fsID: String) async throws -> DirectLink {
         do {
             let dir = try await ensureTransferDir()
             let path = try await transfer(state: state, fsID: fsID, toDir: dir)
             return try await locatedownload(path: path)
         } catch {
-            RequestLog.add("BAIDU", step: "转存链路失败", detail: error.localizedDescription + "，改用 sharedownload", ok: false)
+            RequestLog.add("BAIDU", step: "转存链路失败",
+                           detail: error.localizedDescription + "，改用 sharedownload", ok: false)
             return try await sharedDownload(state: state, fsID: fsID)
         }
-    }
-
-    // MARK: - 3b. sharedownload（不走转存）
-
-    private func firstMatch(_ pattern: String, in text: String) -> String? {
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let match = re.firstMatch(in: text, options: [], range: range),
-              match.numberOfRanges > 1,
-              let r = Range(match.range(at: 1), in: text) else { return nil }
-        return String(text[r])
-    }
-
-    func sharedDownload(state: BaiduShareState, fsID: String) async throws -> DirectLink {
-        let pageURL = URL(string: "https://pan.baidu.com/s/1\(state.surl)")!
-        var pageRequest = URLRequest(url: pageURL)
-        pageRequest.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
-        pageRequest.setValue(withSekey(cookie, state.sekey), forHTTPHeaderField: "Cookie")
-        let (data, _) = try await URLSession.shared.data(for: pageRequest)
-        let html = String(data: data, encoding: .utf8) ?? ""
-        guard let sign = firstMatch("\"sign\":\"([0-9A-Za-z]+)\"", in: html),
-              let timestamp = firstMatch("\"timestamp\":(\\d+)", in: html) else {
-            throw AppError.message("分享页里没找到 sign/timestamp（百度页面结构可能变了）")
-        }
-
-        let target = url("https://pan.baidu.com/api/sharedownload", [
-            ("sign", sign), ("timestamp", timestamp), ("channel", "chunlei"),
-            ("web", "1"), ("app_id", Self.appID), ("clienttype", "0")
-        ])
-        var request = URLRequest(url: target)
-        request.httpMethod = "POST"
-        request.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
-        request.setValue(withSekey(cookie, state.sekey), forHTTPHeaderField: "Cookie")
-        request.setValue("https://pan.baidu.com/s/1\(state.surl)", forHTTPHeaderField: "Referer")
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = "encrypt=0&product=share&type=dlink&fid_list=[\(fsID)]".data(using: .utf8)
-
-        let json = try await Net.json(request, platform: "BAIDU", step: "sharedownload")
-        try Self.checkErrno(json)
-        guard let list = json["list"] as? [[String: Any]],
-              let dlink = list.first?["dlink"] as? String,
-              let dlURL = URL(string: dlink) else {
-            throw AppError.message("sharedownload 没返回 dlink")
-        }
-        return DirectLink(url: dlURL, headers: [
-            "User-Agent": Self.netdiskUA,
-            "Referer": "https://pan.baidu.com/",
-            "Cookie": withSekey(cookie, state.sekey)
-        ])
-    }
-
-    static let transferDir = "/云析下载"
-
-    /// 百度不接受转存到根目录（errno=2），必须先有一个真实目录
-    func ensureTransferDir() async throws -> String {
-        let token = try await bdstoken()
-        let target = url("https://pan.baidu.com/api/create", [
-            ("a", "commit"), ("channel", "chunlei"), ("web", "1"),
-            ("app_id", Self.appID), ("clienttype", "0"), ("bdstoken", token)
-        ])
-        var request = URLRequest(url: target)
-        request.httpMethod = "POST"
-        request.setValue(Self.webUA, forHTTPHeaderField: "User-Agent")
-        request.setValue(cookie, forHTTPHeaderField: "Cookie")
-        request.setValue("https://pan.baidu.com/disk/main", forHTTPHeaderField: "Referer")
-        request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
-        let body = "path=\(Net.encode(Self.transferDir))&isdir=1&size&block_list=%5B%5D&method=post&dataType=json"
-        request.httpBody = body.data(using: .utf8)
-        do {
-            let json = try await Net.json(request, platform: "BAIDU", step: "建转存目录")
-            let errno = (json["errno"] as? NSNumber)?.intValue ?? 0
-            // -8 = 目录已存在，属于正常
-            if errno != 0 && errno != -8 {
-                RequestLog.add("BAIDU", step: "建转存目录", detail: "errno=\(errno)，继续尝试转存", ok: false)
-            }
-        } catch {
-            RequestLog.add("BAIDU", step: "建转存目录", detail: error.localizedDescription, ok: false)
-        }
-        return Self.transferDir
     }
 
     // MARK: - 错误码
